@@ -1,0 +1,378 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Kaggle code
+
+# Keras Implementation
+
+First, we prepare the working environment.
+```{r}
+rm(list=ls()) # Clear the environment
+
+```
+
+
+```{r}
+if(!require(tidyverse)){
+  install.packages("tidyverse")
+  library(tidyverse)
+}
+if(!require(tidytext)){
+  install.packages("tidytext")
+  library(tidytext)
+}
+
+if(!require(wordcloud)){
+  install.packages("wordcloud")
+  library(wordcloud)
+}
+if(!require(gridExtra)){
+  install.packages("gridExtra")
+  library(gridExtra)
+}
+if(!require(grid)){
+  install.packages("grid")
+  library(grid)
+}
+if(!require(keras)){
+  install.packages("keras")
+  library(keras)
+}
+
+if(!require(neuralnet)){
+  install.packages("neuralnet")
+  library(neuralnet)
+}
+if(!require(tensorflow)){
+  install.packages("tensorflow")
+  library(tensorflow)
+}
+
+library(tidyverse) # importing, cleaning, visualising 
+library(tidytext) # working with text
+library(wordcloud) # visualising text
+library(gridExtra) # extra plot options
+library(grid) # extra plot options
+library(keras) # deep learning with keras
+library(caTools)
+
+```
+
+
+Now we want to compare the 2 files
+
+```{r}
+training <- read.csv("trainnew.csv",stringsAsFactors=FALSE)
+test <- read_csv("test.csv")
+str(training)
+
+```
+
+```{r}
+train = training %>% mutate(Split = "train")
+test = test %>% mutate(Split = "test")
+
+
+# Combine
+full = data.frame(rbind(train %>% select(-sentiment), test))
+
+# Top words ---------------------------------------------------------------
+
+# Have a look at the most common words (having removed stop words)
+
+top_words_train = full %>% 
+  filter(Split == "training") %>% 
+  unnest_tokens(output = word, input = tweet) %>% 
+  group_by(word) %>% 
+  summarise(n = n()) %>% 
+  arrange(desc(n))
+  
+
+top_words_test = full %>% 
+  filter(Split == "test") %>% 
+  unnest_tokens(output = word, input = tweet) %>% 
+  group_by(word) %>% 
+  summarise(n = n()) %>% 
+  arrange(desc(n))
+
+```
+
+
+
+```{r}
+# Part of the online machine learning notebook analysing sentiments
+# No harm including it in the code
+
+full = full %>% mutate(
+  Phrase = gsub(" n't"," not", tolower(tweet)), 
+  Phrase = gsub("he 's","he is", tolower(tweet)), 
+  Phrase = gsub("she 's","she is", tolower(tweet)), 
+  Phrase = gsub("what 's","what is", tolower(tweet)), 
+  Phrase = gsub("that 's","that is", tolower(tweet)), 
+  Phrase = gsub("there 's","there is", tolower(tweet)), 
+  Phrase = gsub("-lrb-"," ", tolower(tweet)),
+  Phrase = gsub("-rrb-"," ", tolower(tweet)),
+  
+  # Going to remove all instances of "'s" that remain (nearly always possession)
+  # This way we retain the immediate connection between the possession and possessor in our sequence
+  # Otherwise we will end up padding it with zeros and lose some information
+  
+  Phrase = gsub(" 's "," ", tolower(Phrase))
+)
+```
+
+
+Working on the text
+
+```{r}
+# Setup some parameters
+# When we did the random forest and doubled the predictors to 460, we got our 2nd best result
+# We decide to do the same 
+
+max_words = 460 # Maximum number of words to consider as features
+maxlen = 32 # Text cutoff after n words
+
+
+# Prepare to tokenize the text
+
+texts = full$tweet
+
+tokenizer = text_tokenizer(num_words = max_words) %>% 
+  fit_text_tokenizer(texts)
+
+# Tokenize - i.e. convert text into a sequence of integers
+
+sequences = texts_to_sequences(tokenizer, texts)
+word_index = tokenizer$word_index
+
+# Pad out texts so everything is the same length
+
+data = pad_sequences(sequences, maxlen = maxlen)
+
+
+# Split back into train and test
+
+train_matrix = data[1:nrow(train),]
+test_matrix = data[(nrow(train)+1):nrow(data),]
+
+
+# Prepare training labels (need to be binary matrices)
+
+labels = train$sentiment
+labels = labels %>%  data.frame() %>%
+  mutate(
+    V1 = ifelse(labels == 1, 1, 0),
+    V2 = ifelse(labels == 2, 1, 0),
+    V3 = ifelse(labels == 3, 1, 0)
+  ) %>% 
+  select(
+    V1,V2,V3
+  ) %>% as.matrix()
+
+
+# Prepare a validation set
+training_samples = nrow(train_matrix)*0.80
+validation_samples = nrow(train_matrix)*0.20
+
+indices = sample(1:nrow(train_matrix))
+training_indices = indices[1:training_samples]
+validation_indices = indices[(training_samples + 1): (training_samples + validation_samples)]
+
+x_train = train_matrix[training_indices,]
+y_train = labels[training_indices,]
+
+x_val = train_matrix[validation_indices,]
+y_val = labels[validation_indices,]
+
+
+
+```
+
+
+
+# Here we take some preprocessed data from the Machine Learning Kaggle notebook we learned from
+# The files are essentially the weights of word vectors from pre-processed models.
+# We want to add them to our analysis in deep learning
+```{r}
+# Embeddings -------------------------------------------------------------------
+
+# Dimensions
+
+glove_twitter_embedding_dim = 200
+fast_wiki_embedding_dim = 300
+fast_crawl_embedding_dim = 300
+word2vec_news_embedding_dim = 300
+
+# Files (uploaded from local pc)
+
+glove_twitter_weights = readRDS("glove_twitter_200d_32.rds")
+fast_wiki_weights = readRDS("fasttext_wiki_300d_32.rds")
+fast_crawl_weights = readRDS("fasttext_crawl_300d_32.rds")
+word2vec_news_weights = readRDS("word2vec_news_300d_32.rds")
+```
+
+
+# Improve Droput Rate
+
+```{r}
+# Setup input
+
+# Model Architecture -------------------------------------------------------------------
+
+# Setup input
+
+input = layer_input(
+  shape = list(NULL),
+  dtype = "int32",
+  name = "input"
+)
+
+# Embedding layers
+
+# For the lstm, we want to ensure that no overfitting occurs, so a random subset of word vectors are dropped
+
+set.seed(1231)
+encoded_1 = input %>% 
+  layer_embedding(input_dim = max_words, output_dim = glove_twitter_embedding_dim, name = "embedding_1") %>% 
+  layer_lstm(units = maxlen,
+             dropout = 0.2,
+             recurrent_dropout = 0.5,
+             return_sequences = FALSE) 
+
+set.seed(1231)
+encoded_2 = input %>% 
+  layer_embedding(input_dim = max_words, output_dim = fast_wiki_embedding_dim, name = "embedding_2") %>% 
+  layer_lstm(units = maxlen,
+             dropout = 0.2,
+             recurrent_dropout = 0.5,
+             return_sequences = FALSE) 
+
+set.seed(1231)
+encoded_3 = input %>% 
+  layer_embedding(input_dim = max_words, output_dim = fast_crawl_embedding_dim, name = "embedding_3") %>% 
+  layer_lstm(units = maxlen,
+             dropout = 0.2,
+             recurrent_dropout = 0.5,
+             return_sequences = FALSE) 
+
+set.seed(1231)
+encoded_4 = input %>% 
+  layer_embedding(input_dim = max_words, output_dim = word2vec_news_embedding_dim, name = "embedding_4") %>% 
+  layer_lstm(units = maxlen,
+             dropout = 0.2,
+             recurrent_dropout = 0.5,
+             return_sequences = FALSE) 
+
+
+# Concatenate
+# We want to put the layers together
+
+concatenated = layer_concatenate(list(encoded_1,encoded_2,encoded_3,encoded_4))
+
+# Dense layers
+
+# Here is the layer for the output in the keras model
+
+set.seed(1231)
+dense = concatenated %>% 
+  layer_dropout(rate = 0.5) %>% 
+  layer_dense(units = 128, activation = "relu") %>% 
+  layer_dropout(rate = 0.5) %>% 
+  layer_dense(units = 3, activation = "softmax")
+
+# Bring model together
+
+model = keras_model(input, dense)
+
+
+# Freeze the embedding weights initially to prevent updates propgating back through and ruining our embedding
+
+# We don't want our embedded weights to be modified significantly
+ 
+get_layer(model, name = "embedding_1") %>% 
+  set_weights(list(glove_twitter_weights)) %>% 
+  freeze_weights()
+
+get_layer(model, name = "embedding_2") %>% 
+  set_weights(list(fast_wiki_weights)) %>% 
+  freeze_weights()
+
+get_layer(model, name = "embedding_3") %>% 
+  set_weights(list(fast_crawl_weights)) %>% 
+  freeze_weights()
+
+get_layer(model, name = "embedding_4") %>% 
+  set_weights(list(word2vec_news_weights)) %>% 
+  freeze_weights()
+```
+
+```{r}
+
+# Compile the model. Measure the loss by categorical cross entropy, since we are doing
+# Categorical classification
+
+model %>% compile(
+  optimizer = optimizer_rmsprop(lr = 0.001),
+  loss = "categorical_crossentropy",
+  metrics = "categorical_accuracy"
+)
+
+print(model)
+
+```
+
+
+# Improve batch size
+
+```{r}
+# Early stopping condition
+
+ callbacks_list = list(
+   callback_early_stopping(
+     monitor = 'val_loss',
+     patience = 10
+   ))
+
+# Train the model over about 100 epochs
+# Too many epochs results in overfitting, where the loss and validation loss differ significantly
+set.seed(1231)
+history = model %>% fit(
+  x_train,
+  y_train,
+  batch_size = 2048,
+  validation_data = list(x_val, y_val),
+  epochs = 100,
+  view_metrics = TRUE,
+  verbose = 0
+)
+
+# Look at training results
+
+print(history)
+
+# So even when setting the seed, the output can change over time. Regardless, the accuracy
+# Is roughly consistent, so the model is good in our opinion
+
+```
+
+```{r}
+# Produce and save submission
+
+predict_class = function(x){which.max(x)-1}
+predictions = predict(model, test_matrix)
+predictions = apply(predictions,1,predict_class)
+
+submission = data.frame(cbind(test$Id, predictions))
+names(submission) = c("Id", "sentiment")
+
+# The obtained predictions range from 0 to 2, which correspond to sentiments 1 to 3. Add 1 to
+# the classification to obtain the proper predicted sentiment, then save it into a file
+submission$sentiment = as.integer(submission$sentiment) + 1
+submission$Id = as.integer(submission$Id)
+
+write_csv(submission, "Final Kaggle Submission.csv")
+
+```
+
